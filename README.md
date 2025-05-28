@@ -13,6 +13,7 @@ Send commands to `/tmp/brightness.sock`:
 - `wakeup` - Wake up monitor
 
 ## Usage
+```
 echo "get" | nc -U /tmp/brightness.sock
 echo "inc" | nc -U /tmp/brightness.sock
 echo "dec" | nc -U /tmp/brightness.sock
