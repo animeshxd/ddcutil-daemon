@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -13,21 +13,27 @@ import (
 )
 
 const (
-	socketPath    = "/tmp/brightness.sock"
-	vcCode        = "10"
-	monitorID     = "1"
-	debounceTime  = 300 * time.Millisecond
-	maxBrightness = 100
+	socketPath      = "/tmp/brightness.sock"
+	brightnessVCP   = "10"
+	powerVCP        = "d6"
+	monitorID       = "1"
+	debounceTime    = 300 * time.Millisecond
+	maxBrightness   = 100
+	powerOn         = "01"
+	powerOff        = "04"
+	brightnessStep  = 10
+	waybarSignalNum = "5"
 )
 
 var (
 	mu       sync.Mutex
 	incCount int
 	decCount int
+	logger   *slog.Logger
 )
 
-func getBrightness() (current int, max int, err error) {
-	out, err := exec.Command("ddcutil", "getvcp", vcCode, "--brief", "--display", monitorID).Output()
+func getCurrentBrightness() (current int, max int, err error) {
+	out, err := exec.Command("ddcutil", "getvcp", brightnessVCP, "--brief", "--display", monitorID).Output()
 	if err != nil {
 		return 0, 0, err
 	}
@@ -38,26 +44,47 @@ func getBrightness() (current int, max int, err error) {
 	return current, max, nil
 }
 
-func setBrightness(value int) {
-	log.Printf("Setting brightness to %d%%", value)
-	cmd := exec.Command("ddcutil", "setvcp", vcCode, fmt.Sprint(value), "--display", monitorID)
+func adjustBrightnessValue(value int) {
+	logger.Info("adjusting brightness", "value", value)
+	cmd := exec.Command("ddcutil", "setvcp", brightnessVCP, fmt.Sprint(value), "--display", monitorID)
 	err := cmd.Run()
 	if err != nil {
-		log.Printf("Failed to set brightness: %v", err)
+		logger.Error("failed to set brightness", "error", err)
+		return
 	}
-	notifyWaybar()
+	signalWaybarUpdate()
 }
 
-func notifyWaybar() error {
-	log.Println("Reloading waybar with -SIGRTMIN+5")
-	err := exec.Command("pkill", "-SIGRTMIN+5", "waybar").Run()
+func signalWaybarUpdate() error {
+	logger.Debug("sending waybar reload signal")
+	err := exec.Command("pkill", "-SIGRTMIN+"+waybarSignalNum, "waybar").Run()
 	if err != nil {
-		fmt.Errorf("failed to reload module %v", err)
+		logger.Error("failed to reload waybar module", "error", err)
+		return err
 	}
-	return err
+	return nil
 }
 
-func debounceLoop() {
+func setMonitorPower(powerState string) error {
+	logger.Info("setting monitor power state", "state", powerState)
+	cmd := exec.Command("ddcutil", "setvcp", powerVCP, powerState, "--display", monitorID)
+	err := cmd.Run()
+	if err != nil {
+		logger.Error("failed to set monitor power state", "error", err)
+		return err
+	}
+	return nil
+}
+
+func putMonitorToSleep() error {
+	return setMonitorPower(powerOff)
+}
+
+func wakeupMonitor() error {
+	return setMonitorPower(powerOn)
+}
+
+func processCoalescedCommands() {
 	for {
 		time.Sleep(debounceTime)
 		mu.Lock()
@@ -69,27 +96,31 @@ func debounceLoop() {
 			continue
 		}
 
-		log.Printf("Coalesced commands: +%d, -%d", i, d)
+		logger.Info("processing coalesced brightness commands", "increase", i, "decrease", d)
 
-		curr, max, _ := getBrightness()
+		curr, max, err := getCurrentBrightness()
+		if err != nil {
+			logger.Error("failed to get current brightness", "error", err)
+			continue
+		}
 
-		newVal := curr + (i * 10) - (d * 10)
+		newVal := curr + (i * brightnessStep) - (d * brightnessStep)
 		if newVal > max {
 			newVal = max
 		} else if newVal < 0 {
 			newVal = 0
 		}
-		go setBrightness(newVal)
+		go adjustBrightnessValue(newVal)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleClientConnection(conn net.Conn) {
 	defer conn.Close()
-	log.Printf("Client connected")
+	logger.Info("client connected")
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		cmd := strings.TrimSpace(scanner.Text())
-		log.Printf("Received: %q", cmd)
+		logger.Debug("received command", "command", cmd)
 
 		switch cmd {
 		case "inc":
@@ -105,7 +136,12 @@ func handleConnection(conn net.Conn) {
 			conn.Write([]byte("ok\n"))
 			return
 		case "get":
-			current, max, _ := getBrightness()
+			current, max, err := getCurrentBrightness()
+			if err != nil {
+				logger.Error("failed to get brightness for get command", "error", err)
+				conn.Write([]byte("error\n"))
+				return
+			}
 			if max == 0 {
 				max = maxBrightness
 			}
@@ -113,39 +149,86 @@ func handleConnection(conn net.Conn) {
 			if percent == 0 {
 				percent = 1
 			}
-			conn.Write(fmt.Appendf(nil, "{\"percentage\": %d}\n", percent))
+			response := fmt.Sprintf("{\"percentage\": %d}\n", percent)
+			conn.Write([]byte(response))
+			return
+		case "sleep":
+			err := putMonitorToSleep()
+			if err != nil {
+				conn.Write([]byte("error\n"))
+			} else {
+				conn.Write([]byte("ok\n"))
+			}
+			return
+		case "wakeup":
+			err := wakeupMonitor()
+			if err != nil {
+				conn.Write([]byte("error\n"))
+			} else {
+				conn.Write([]byte("ok\n"))
+			}
 			return
 		default:
-			log.Printf("Unknown command: %q", cmd)
+			logger.Warn("unknown command received", "command", cmd)
 			conn.Write([]byte("Invalid command\n"))
 			return
 		}
 	}
 }
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	if err := os.RemoveAll(socketPath); err != nil {
-		log.Fatalf("Failed to remove existing socket: %v", err)
+func setupLogger() {
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelInfo,
 	}
+	handler := slog.NewTextHandler(os.Stdout, opts)
+	logger = slog.New(handler)
+}
 
+func cleanupExistingSocket() error {
+	if err := os.RemoveAll(socketPath); err != nil {
+		return fmt.Errorf("failed to remove existing socket: %w", err)
+	}
+	return nil
+}
+
+func createUnixSocket() (net.Listener, error) {
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		log.Fatalf("Socket error: %v", err)
+		return nil, fmt.Errorf("socket creation error: %w", err)
+	}
+
+	if err := os.Chmod(socketPath, 0666); err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("failed to set socket permissions: %w", err)
+	}
+
+	return listener, nil
+}
+
+func main() {
+	setupLogger()
+
+	if err := cleanupExistingSocket(); err != nil {
+		logger.Error("socket cleanup failed", "error", err)
+		os.Exit(1)
+	}
+
+	listener, err := createUnixSocket()
+	if err != nil {
+		logger.Error("socket setup failed", "error", err)
+		os.Exit(1)
 	}
 	defer listener.Close()
-	os.Chmod(socketPath, 0666)
 
-	go debounceLoop()
+	go processCoalescedCommands()
 
-	log.Println("Mock brightness server running at", socketPath)
+	logger.Info("ddcutil daemon started", "socket", socketPath)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			logger.Error("connection accept error", "error", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleClientConnection(conn)
 	}
 }
